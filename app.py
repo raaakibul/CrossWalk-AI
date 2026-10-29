@@ -1,454 +1,730 @@
-import os
-import streamlit as st
-import pandas as pd
+
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import streamlit as st
 
-from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import KMeans
-from sklearn.model_selection import train_test_split
+from sklearn.base import clone
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+# APPLICATION CONFIGURATION
 
 st.set_page_config(
-    page_title="CrossWalk AI — Dhaka",
+    page_title="CrossWalkGap | Dhaka",
     page_icon="🚸",
-    layout="wide"
+    layout="wide",
 )
 
-BARRIER_COLS = [
-    "V1 Crosswalk usage is time-consuming",
-    "V2 Absence of guard rails on median",
-    "V3 Unsuitability of crosswalk location",
-    "V4 Feel unsafe to cross directly without a crosswalk",
-    "V5 Inadequate marking and sign to locate crosswalk",
-    "V6 Poor entry access to crosswalk",
-    "V7 Difficulty crossing road using crosswalk",
-    "V8 Inadequate lightning at night near crosswalk",
-]
+DATA_PATH = (
+    Path(__file__).resolve().parent
+    / "Survey-data-on-pedestrian-crosswalk-usage-behavior-in-Dhaka.xlsx"
+)
 
 BARRIER_LABELS = {
-    "V1 Crosswalk usage is time-consuming": "Time-consuming",
-    "V2 Absence of guard rails on median": "No median guard rails",
-    "V3 Unsuitability of crosswalk location": "Poor location",
-    "V4 Feel unsafe to cross directly without a crosswalk": "Safety motivation",
-    "V5 Inadequate marking and sign to locate crosswalk": "Poor markings/signs",
-    "V6 Poor entry access to crosswalk": "Poor entry access",
-    "V7 Difficulty crossing road using crosswalk": "Crossing difficulty",
-    "V8 Inadequate lightning at night near crosswalk": "Poor night lighting",
+    "V1: Crosswalk usage is time-consuming": "Time-consuming",
+    "V2: Absence of guard rails on median": "No median guard rails",
+    "V3: Unsuitability of crosswalk location": "Poor location",
+    "V4: Feel unsafe to cross directly without a crosswalk":
+        "Safety motivation",
+    "V5: Inadequate marking and sign to locate crosswalk":
+        "Poor markings/signs",
+    "V6: Poor entry access to crosswalk": "Poor entry access",
+    "V7: Difficulty crossing road using crosswalk":
+        "Crossing difficulty",
+    "V8: Inadequate lightning at night near crosswalk":
+        "Poor night lighting",
 }
 
-SHORT_BARRIERS = [BARRIER_LABELS[col] for col in BARRIER_COLS]
+BARRIER_COLS = list(BARRIER_LABELS.keys())
 
-REQUIRED_COLS = [
+FREQUENCY_ORDER = [
+    "Very rarely",
+    "Once or twice a month",
+    "Once or twice a week",
+    "Every day",
+    "More than once a day",
+]
+
+FREQUENCY_SCORE = {
+    value: index for index, value in enumerate(FREQUENCY_ORDER)
+}
+
+DEMOGRAPHIC_COLS = [
     "Gender",
-    "Age years",
+    "Age (years)",
     "Do you prefer to use crosswalk",
     "How often do you use crosswalk",
-] + BARRIER_COLS
+]
 
+# DATA LOADING AND VALIDATION
+ 
 
 @st.cache_data
-def load_data():
-    file = os.path.join(
-        os.path.dirname(__file__),
-        "Survey-data-on-pedestrian-crosswalk-usage-behavior-in-Dhaka.xlsx"
-    )
+def load_data(file_path):
+    """Load the Excel dataset and validate its structure."""
 
-    if not os.path.exists(file):
-        st.error(f"Excel file not found:\n\n{file}")
-        st.stop()
+    path = Path(file_path)
 
-    raw_df = pd.read_excel(file, sheet_name=0, header=None)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Dataset not found: {path}\n"
+            "Place the Excel file beside app.py."
+        )
 
-    header_row = None
+    df = pd.read_excel(path, sheet_name=0)
 
-    for i in range(min(20, len(raw_df))):
-        row_values = raw_df.iloc[i].astype(str).str.strip().tolist()
-
-        if "Gender" in row_values:
-            header_row = i
-            break
-
-    if header_row is None:
-        st.error("Could not find the header row containing 'Gender'.")
-        st.write(raw_df.head(10))
-        st.stop()
-
-    df = pd.read_excel(file, sheet_name=0, header=header_row)
-
+    # Normalize column names.
     df.columns = (
-        df.columns
-        .astype(str)
+        df.columns.astype(str)
         .str.replace("\n", " ", regex=False)
         .str.replace(r"\s+", " ", regex=True)
         .str.strip()
     )
 
-    df = df[df["Gender"].astype(str).str.strip().str.lower() != "gender"]
-
-    missing = [col for col in REQUIRED_COLS if col not in df.columns]
+    required = DEMOGRAPHIC_COLS + BARRIER_COLS
+    missing = [col for col in required if col not in df.columns]
 
     if missing:
-        st.error("These required columns were not found:\n\n" + "\n".join(missing))
-        st.write("Columns pandas actually found:")
-        st.write(list(df.columns))
-        st.stop()
+        raise ValueError(
+            "Missing expected columns:\n"
+            + "\n".join(missing)
+            + "\n\nColumns found:\n"
+            + "\n".join(df.columns.astype(str))
+        )
 
-    for col in [
-        "Gender",
-        "Age years",
-        "Do you prefer to use crosswalk",
-        "How often do you use crosswalk"
-    ]:
-        df[col] = df[col].astype(str).str.strip()
+    # Clean text columns.
+    for col in DEMOGRAPHIC_COLS:
+        df[col] = df[col].astype("string").str.strip()
 
+    # Convert barrier responses into numeric values.
     for col in BARRIER_COLS:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = df.dropna(subset=BARRIER_COLS)
+    # Keep recognized frequency responses.
+    df = df[
+        df["How often do you use crosswalk"].isin(FREQUENCY_ORDER)
+    ].copy()
 
-    barrier_mean = df[
-        [
-            BARRIER_COLS[0],
-            BARRIER_COLS[1],
-            BARRIER_COLS[2],
-            BARRIER_COLS[4],
-            BARRIER_COLS[5],
-            BARRIER_COLS[6],
-            BARRIER_COLS[7],
-        ]
-    ].mean(axis=1)
+    # Exclude records without barrier ratings for this analysis.
+    df = df.dropna(subset=BARRIER_COLS).copy()
 
-    df["Crosswalk Barrier Index"] = barrier_mean - df[BARRIER_COLS[3]]
+    # Define frequent use as weekly or more frequent.
+    # This is an operational definition, not an original dataset label.
+    df["Frequency score"] = (
+        df["How often do you use crosswalk"].map(FREQUENCY_SCORE)
+    )
 
-    frequency_map = {
-        "Very rarely": 0,
-        "Once or twice a month": 1,
-        "Once or twice a week": 2,
-        "Every day": 3,
-        "More than once a day": 4,
-    }
+    df["Frequent user (weekly+)"] = (
+        df["Frequency score"] >= 2
+    ).astype(int)
 
-    df["Usage Score"] = df["How often do you use crosswalk"].map(frequency_map)
-    df["Frequent User"] = (df["Usage Score"] >= 2).astype(int)
+    df["Mean barrier rating"] = df[BARRIER_COLS].mean(axis=1)
 
     return df
 
+# 3. MACHINE-LEARNING MODELS
 
-@st.cache_resource
-def train_models(df):
-    X = df[BARRIER_COLS].copy()
-    y = df["Frequent User"]
+def get_models():
+    """Build reproducible model pipelines."""
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    return {
+        "Logistic regression": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            (
+                "classifier",
+                LogisticRegression(
+                    class_weight="balanced",
+                    max_iter=2000,
+                    random_state=42,
+                ),
+            ),
+        ]),
 
-    kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
-    df["Persona Cluster"] = kmeans.fit_predict(X_scaled)
+        "Random forest": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            (
+                "classifier",
+                RandomForestClassifier(
+                    n_estimators=400,
+                    min_samples_leaf=3,
+                    class_weight="balanced",
+                    random_state=42,
+                    n_jobs=-1,
+                ),
+            ),
+        ]),
+    }
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.25, random_state=42, stratify=y
-    )
 
-    model = RandomForestClassifier(
-        n_estimators=300,
-        max_depth=8,
+def evaluate_models(df):
+    """
+    Evaluate models using stratified cross-validation.
+
+    Out-of-fold predictions are used for the reported metrics.
+    """
+
+    X = df[BARRIER_COLS]
+    y = df["Frequent user (weekly+)"]
+
+    if y.nunique() != 2:
+        raise ValueError(
+            "Both outcome classes are required for classification."
+        )
+
+    smallest_class = int(y.value_counts().min())
+    n_splits = min(5, smallest_class)
+
+    if n_splits < 2:
+        raise ValueError(
+            "Not enough observations in each class for cross-validation."
+        )
+
+    cv = StratifiedKFold(
+        n_splits=n_splits,
+        shuffle=True,
         random_state=42,
-        class_weight="balanced"
-    )
-    model.fit(X_train, y_train)
-
-    y_pred = model.predict(X_test)
-    accuracy = accuracy_score(y_test, y_pred)
-
-    importance = pd.DataFrame({
-        "Barrier": SHORT_BARRIERS,
-        "Importance": model.feature_importances_
-    }).sort_values("Importance", ascending=False)
-
-    return (
-        df,
-        kmeans,
-        model,
-        scaler,
-        accuracy,
-        classification_report(y_test, y_pred, output_dict=True),
-        confusion_matrix(y_test, y_pred),
-        importance
     )
 
+    models = get_models()
+    results = []
+    predictions = {}
 
-def persona_name(row):
-    if row["Crosswalk Barrier Index"] >= 1.5:
-        return "High-Barrier Avoiders"
-    elif row[BARRIER_COLS[3]] >= 4:
-        return "Safety-Motivated Users"
-    elif row[BARRIER_COLS[7]] >= 4:
-        return "Night-Risk Sensitive Pedestrians"
-    elif row[BARRIER_COLS[0]] >= 4:
-        return "Time-Pressured Pedestrians"
-    else:
-        return "Convenience-Oriented Users"
+    for name, model in models.items():
+
+        # Each row is predicted by a model that excluded that row
+        # from its training fold.
+        pred = cross_val_predict(
+            model, X, y, cv=cv, method="predict"
+        )
+
+        probabilities = cross_val_predict(
+            model, X, y, cv=cv, method="predict_proba"
+        )[:, 1]
+
+        results.append({
+            "Model": name,
+            "Balanced accuracy": balanced_accuracy_score(y, pred),
+            "Precision": precision_score(
+                y, pred, zero_division=0
+            ),
+            "Recall": recall_score(
+                y, pred, zero_division=0
+            ),
+            "F1": f1_score(
+                y, pred, zero_division=0
+            ),
+            "ROC-AUC": roc_auc_score(y, probabilities),
+        })
+
+        predictions[name] = {
+            "pred": pred,
+            "prob": probabilities,
+        }
+
+    return pd.DataFrame(results), predictions, models
 
 
-def radar_chart(values, title):
+# VISUALIZATION HELPER
+
+def make_radar_chart(values, title):
+    """Create a radar chart of eight barrier ratings."""
+
+    labels = [BARRIER_LABELS[col] for col in BARRIER_COLS]
+    values = list(values)
+
     fig = go.Figure()
 
-    fig.add_trace(go.Scatterpolar(
-        r=values,
-        theta=SHORT_BARRIERS,
-        fill="toself",
-        name="Perception score"
-    ))
+    fig.add_trace(
+        go.Scatterpolar(
+            r=values + [values[0]],
+            theta=labels + [labels[0]],
+            fill="toself",
+            name="Barrier ratings",
+        )
+    )
 
     fig.update_layout(
         title=title,
-        polar=dict(radialaxis=dict(range=[0, 5])),
-        height=500
+        polar={
+            "radialaxis": {
+                "visible": True,
+                "range": [0, 5],
+            }
+        },
+        height=480,
+        showlegend=False,
     )
 
     return fig
 
 
-df, kmeans, model, scaler, accuracy, report, cm, importance = train_models(load_data())
+# LOAD THE DATASET
 
-df["Persona"] = df.apply(persona_name, axis=1)
+try:
+    df = load_data(str(DATA_PATH))
 
-st.sidebar.title("🚸 CrossWalk AI")
-st.sidebar.info(
-    "An explainable pedestrian-safety analytics tool for crosswalk "
-    "usage behavior in Dhaka, Bangladesh."
+except Exception as error:
+    st.error(f"Could not load the dataset: {error}")
+    st.stop()
+
+
+# 6. NAVIGATION
+
+st.sidebar.title("CrossWalkGap")
+
+st.sidebar.caption(
+    "Pedestrian crosswalk survey analysis"
 )
 
 page = st.sidebar.radio(
     "Navigate",
     [
         "Overview",
-        "Barrier Index",
-        "Pedestrian Personas",
-        "Prediction Model",
-        "Policy Simulator"
-    ]
+        "Barrier patterns",
+        "Group comparisons",
+        "Model evaluation",
+        "Profile explorer",
+        "Data quality and limitations",
+    ],
 )
 
+st.title("CrossWalkGap: Pedestrian Crosswalk Behavior")
+
+st.write(
+    "An exploratory analytics application using survey responses "
+    "about crosswalk use and perceived pedestrian barriers in Dhaka, "
+    "Bangladesh. Survey associations do not establish causation."
+)
+
+
+# OVERVIEW DASHBOARD
+
 if page == "Overview":
-    st.title("🚸 CrossWalk AI: Pedestrian Crossing Behavior in Dhaka")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Survey responses", len(df))
-    c2.metric("Prefer crosswalk", f"{(df['Do you prefer to use crosswalk'] == 'Yes').mean():.1%}")
-    c3.metric("Frequent users", f"{df['Frequent User'].mean():.1%}")
-    c4.metric("Model accuracy", f"{accuracy:.1%}")
+    preferred = (
+        df["Do you prefer to use crosswalk"]
+        .str.lower()
+        .eq("yes")
+        .mean()
+    )
 
-    st.subheader("Crosswalk usage frequency")
-    freq_counts = df["How often do you use crosswalk"].value_counts().reset_index()
-    freq_counts.columns = ["Frequency", "Respondents"]
+    frequent = df["Frequent user (weekly+)"].mean()
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric("Usable responses", f"{len(df):,}")
+    col2.metric("Prefer crosswalk", f"{preferred:.1%}")
+    col3.metric("Weekly-or-more users", f"{frequent:.1%}")
+    col4.metric(
+        "Duplicate rows",
+        f"{int(df.duplicated().sum()):,}",
+    )
+
+    st.subheader("Crosswalk-use frequency")
+
+    frequency_counts = (
+        df["How often do you use crosswalk"]
+        .value_counts()
+        .reindex(FREQUENCY_ORDER, fill_value=0)
+        .rename_axis("Frequency")
+        .reset_index(name="Respondents")
+    )
 
     fig = px.bar(
-        freq_counts,
+        frequency_counts,
         x="Frequency",
         y="Respondents",
-        color="Frequency",
-        title="How often respondents use crosswalks"
+        category_orders={"Frequency": FREQUENCY_ORDER},
+        title="Self-reported crosswalk-use frequency",
     )
+
     st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Average barrier perception")
-    avg_scores = df[BARRIER_COLS].mean().reset_index()
-    avg_scores.columns = ["Barrier", "Average score"]
-    avg_scores["Barrier"] = avg_scores["Barrier"].map(BARRIER_LABELS)
+    st.subheader("Average perceived barrier ratings")
+
+    averages = (
+        df[BARRIER_COLS]
+        .mean()
+        .rename(index=BARRIER_LABELS)
+        .sort_values()
+        .rename_axis("Barrier")
+        .reset_index(name="Mean rating")
+    )
 
     fig = px.bar(
-        avg_scores.sort_values("Average score"),
-        x="Average score",
+        averages,
+        x="Mean rating",
         y="Barrier",
         orientation="h",
-        title="Which barriers are perceived as most severe?",
-        color="Average score",
-        color_continuous_scale="Viridis"
+        title="Average rating for each barrier",
     )
+
     st.plotly_chart(fig, use_container_width=True)
 
-elif page == "Barrier Index":
-    st.title("📊 Crosswalk Barrier Index")
-
-    fig = px.histogram(
-        df,
-        x="Crosswalk Barrier Index",
-        color="Do you prefer to use crosswalk",
-        barmode="overlay",
-        nbins=30,
-        title="Barrier Index by crosswalk preference"
+    st.caption(
+        "Check the original questionnaire to confirm the response "
+        "scale before interpreting the numerical averages."
     )
-    st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Barrier profile by gender")
-    gender_avg = df.groupby("Gender")[BARRIER_COLS].mean().reset_index()
 
-    gender_melted = gender_avg.melt(
-        id_vars="Gender",
+#BARRIER PATTERN ANALYSIS
+
+elif page == "Barrier patterns":
+
+    st.subheader("Barrier ratings by reported usage")
+
+    plot_df = df.copy()
+
+    plot_df["Usage group"] = (
+        plot_df["Frequent user (weekly+)"]
+        .map({
+            0: "Less than weekly",
+            1: "Weekly or more",
+        })
+    )
+
+    melted = plot_df.melt(
+        id_vars="Usage group",
+        value_vars=BARRIER_COLS,
         var_name="Barrier",
-        value_name="Average score"
+        value_name="Rating",
     )
-    gender_melted["Barrier"] = gender_melted["Barrier"].map(BARRIER_LABELS)
+
+    melted["Barrier"] = melted["Barrier"].map(BARRIER_LABELS)
+
+    summary = (
+        melted.groupby(
+            ["Usage group", "Barrier"],
+            as_index=False,
+        )["Rating"]
+        .mean()
+    )
 
     fig = px.bar(
-        gender_melted,
-        x="Barrier",
-        y="Average score",
-        color="Gender",
+        summary,
+        x="Rating",
+        y="Barrier",
+        color="Usage group",
         barmode="group",
-        title="Average barrier scores by gender"
+        title="Average barriers by usage group",
     )
+
     st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Barrier profile by age group")
-    age_avg = df.groupby("Age years")[BARRIER_COLS].mean().reset_index()
+    st.dataframe(summary, use_container_width=True)
 
-    age_melted = age_avg.melt(
-        id_vars="Age years",
-        var_name="Barrier",
-        value_name="Average score"
+    st.info(
+        "These are descriptive comparisons. Differences do not show "
+        "that a barrier causes a change in crosswalk use."
     )
-    age_melted["Barrier"] = age_melted["Barrier"].map(BARRIER_LABELS)
+
+
+# DEMOGRAPHIC COMPARISONS
+
+elif page == "Group comparisons":
+
+    group_col = st.selectbox(
+        "Compare respondents by",
+        [
+            "Gender",
+            "Age (years)",
+            "Do you prefer to use crosswalk",
+        ],
+    )
+
+    melted = df.melt(
+        id_vars=[group_col],
+        value_vars=BARRIER_COLS,
+        var_name="Barrier",
+        value_name="Rating",
+    )
+
+    melted["Barrier"] = melted["Barrier"].map(BARRIER_LABELS)
+
+    summary = (
+        melted.groupby(
+            [group_col, "Barrier"],
+            dropna=False,
+            as_index=False,
+        )
+        .agg(
+            **{
+                "Mean rating": ("Rating", "mean"),
+                "Responses": ("Rating", "count"),
+            }
+        )
+    )
 
     fig = px.bar(
-        age_melted,
+        summary,
         x="Barrier",
-        y="Average score",
-        color="Age years",
+        y="Mean rating",
+        color=group_col,
         barmode="group",
-        title="Average barrier scores by age group"
+        title=f"Barrier ratings by {group_col}",
     )
+
     st.plotly_chart(fig, use_container_width=True)
 
-elif page == "Pedestrian Personas":
-    st.title("👥 Pedestrian Personas")
+    st.dataframe(summary, use_container_width=True)
 
-    persona_counts = df["Persona"].value_counts().reset_index()
-    persona_counts.columns = ["Persona", "Respondents"]
-
-    fig = px.pie(
-        persona_counts,
-        names="Persona",
-        values="Respondents",
-        hole=0.45,
-        title="Distribution of pedestrian personas"
+    st.caption(
+        "Review group sizes before drawing conclusions. These "
+        "comparisons are not adjusted for other variables."
     )
-    st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Persona profiles")
-    persona_profile = df.groupby("Persona")[
-        BARRIER_COLS + ["Crosswalk Barrier Index", "Frequent User"]
-    ].mean().reset_index()
+
+#MODEL EVALUATION
+
+elif page == "Model evaluation":
+
+    st.subheader("Cross-validated classification")
+
+    st.write(
+        "Outcome: weekly-or-more crosswalk use, derived from the "
+        "reported frequency categories. Predictors: the eight "
+        "barrier ratings."
+    )
+
+    try:
+        results, predictions, models = evaluate_models(df)
+
+    except Exception as error:
+        st.error(f"Model evaluation failed: {error}")
+        st.stop()
 
     st.dataframe(
-        persona_profile.rename(columns=BARRIER_LABELS),
-        use_container_width=True
+        results.style.format({
+            "Balanced accuracy": "{:.3f}",
+            "Precision": "{:.3f}",
+            "Recall": "{:.3f}",
+            "F1": "{:.3f}",
+            "ROC-AUC": "{:.3f}",
+        }),
+        use_container_width=True,
     )
 
-    selected_persona = st.selectbox(
-        "Select a persona",
-        df["Persona"].unique()
+    selected = st.selectbox(
+        "Inspect model predictions",
+        list(models.keys()),
     )
 
-    persona_data = df[df["Persona"] == selected_persona]
-    avg_values = persona_data[BARRIER_COLS].mean().tolist()
+    y_true = df["Frequent user (weekly+)"].to_numpy()
+    y_pred = predictions[selected]["pred"]
 
-    st.plotly_chart(
-        radar_chart(
-            avg_values,
-            f"Barrier profile: {selected_persona}"
-        ),
-        use_container_width=True
+    cm = confusion_matrix(
+        y_true,
+        y_pred,
+        labels=[0, 1],
     )
 
-elif page == "Prediction Model":
-    st.title("🤖 Explainable Prediction Model")
-    st.metric("Test accuracy", f"{accuracy:.1%}")
+    fig = px.imshow(
+        cm,
+        text_auto=True,
+        x=["Predicted: less than weekly", "Predicted: weekly+"],
+        y=["Actual: less than weekly", "Actual: weekly+"],
+        labels={
+            "x": "Predicted class",
+            "y": "Actual class",
+            "color": "Count",
+        },
+        title=f"Out-of-fold confusion matrix: {selected}",
+    )
 
-    col1, col2 = st.columns(2)
+    st.plotly_chart(fig, use_container_width=True)
 
-    with col1:
-        st.subheader("Feature importance")
-        fig = px.bar(
-            importance,
-            x="Importance",
-            y="Barrier",
-            orientation="h",
-            title="Which barriers most affect frequent use?"
+    st.text(
+        classification_report(
+            y_true,
+            y_pred,
+            labels=[0, 1],
+            target_names=[
+                "Less than weekly",
+                "Weekly or more",
+            ],
+            zero_division=0,
         )
-        st.plotly_chart(fig, use_container_width=True)
+    )
 
-    with col2:
-        st.subheader("Confusion matrix")
-        fig = px.imshow(
-            cm,
-            text_auto=True,
-            color_continuous_scale="Blues",
-            labels=dict(x="Predicted", y="Actual"),
-            x=["Not frequent", "Frequent"],
-            y=["Not frequent", "Frequent"],
-            title="Model performance"
+    st.warning(
+        "These are exploratory cross-validation results. The model "
+        "predicts a self-reported survey category, not pedestrian "
+        "crashes or actual road safety. Model performance does not "
+        "demonstrate causation or deployment readiness."
+    )
+
+
+# HYPOTHETICAL PROFILE EXPLORER
+
+
+elif page == "Profile explorer":
+
+    st.subheader("Explore a hypothetical pedestrian profile")
+
+    st.write(
+        "Adjust the ratings to inspect a model estimate. This is "
+        "not a simulation of real-world policy effects."
+    )
+
+    values = {}
+    left, right = st.columns(2)
+
+    for index, col in enumerate(BARRIER_COLS):
+
+        target = left if index < 4 else right
+
+        with target:
+            values[col] = st.slider(
+                BARRIER_LABELS[col],
+                min_value=1,
+                max_value=5,
+                value=3,
+                key=f"barrier_{index}",
+            )
+
+    try:
+        _, _, models = evaluate_models(df)
+
+        selected = st.selectbox(
+            "Select model",
+            list(models.keys()),
         )
-        st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Classification report")
-    report_df = pd.DataFrame(report).transpose()
-    st.dataframe(report_df, use_container_width=True)
+        # Fit a fresh copy on all available survey rows for this
+        # interactive demonstration only.
+        model = clone(models[selected])
+
+        X = df[BARRIER_COLS]
+        y = df["Frequent user (weekly+)"]
+
+        model.fit(X, y)
+
+        profile = pd.DataFrame(
+            [values],
+            columns=BARRIER_COLS,
+        )
+
+        probability = model.predict_proba(profile)[0, 1]
+
+        col1, col2 = st.columns(2)
+
+        col1.metric(
+            "Estimated probability of weekly-or-more use",
+            f"{probability:.1%}",
+        )
+
+        col2.metric(
+            "Classification at 0.50 threshold",
+            "Weekly or more"
+            if probability >= 0.5
+            else "Less than weekly",
+        )
+
+        st.plotly_chart(
+            make_radar_chart(
+                [values[col] for col in BARRIER_COLS],
+                "Hypothetical barrier profile",
+            ),
+            use_container_width=True,
+        )
+
+        st.caption(
+            "This model is fitted on the available dataset for "
+            "demonstration. The estimated probability is model-dependent "
+            "and is not an estimate of the effect of changing a barrier."
+        )
+
+    except Exception as error:
+        st.error(f"Profile explorer failed: {error}")
+
+
+# DATA QUALITY AND LIMITATIONS
 
 else:
-    st.title("🛠️ Policy Simulator")
 
-    col1, col2 = st.columns(2)
+    st.subheader("Data quality checks")
 
-    with col1:
-        time = st.slider("Crosswalk use is time-consuming", 1, 5, 3)
-        rails = st.slider("Absence of median guard rails", 1, 5, 3)
-        location = st.slider("Crosswalk location is unsuitable", 1, 5, 3)
-        safety = st.slider("Feels unsafe crossing without crosswalk", 1, 5, 4)
+    quality = pd.DataFrame({
+        "Check": [
+            "Rows included in analysis",
+            "Exact duplicate rows",
+            "Missing barrier ratings",
+            "Unrecognized frequency categories",
+        ],
+        "Result": [
+            len(df),
+            int(df.duplicated().sum()),
+            int(df[BARRIER_COLS].isna().sum().sum()),
+            int(
+                (~df["How often do you use crosswalk"]
+                 .isin(FREQUENCY_ORDER)).sum()
+            ),
+        ],
+    })
 
-    with col2:
-        markings = st.slider("Inadequate markings and signs", 1, 5, 3)
-        access = st.slider("Poor entry access", 1, 5, 3)
-        difficulty = st.slider("Difficulty crossing using crosswalk", 1, 5, 3)
-        lighting = st.slider("Inadequate night lighting", 1, 5, 3)
+    st.dataframe(quality, use_container_width=True)
 
-    user_input = pd.DataFrame([[
-        time, rails, location, safety, markings, access, difficulty, lighting
-    ]], columns=BARRIER_COLS)
+    st.subheader("Missing values by column")
 
-    prediction = model.predict(user_input)[0]
-    probability = model.predict_proba(user_input)[0][1]
-
-    barrier_index = (
-        np.mean([time, rails, location, markings, access, difficulty, lighting])
-        - safety
+    st.dataframe(
+        df.isna().sum().rename("Missing values").to_frame(),
+        use_container_width=True,
     )
 
-    st.subheader("Simulation result")
+    st.subheader("Frequency response counts")
 
-    if prediction == 1:
-        st.success(
-            f"✅ Predicted: **Frequent crosswalk user** "
-            f"with {probability:.1%} probability."
-        )
-    else:
-        st.warning(
-            f"⚠️ Predicted: **Not a frequent crosswalk user** "
-            f"with {probability:.1%} probability of frequent use."
-        )
-
-    c1, c2 = st.columns(2)
-    c1.metric("Crosswalk Barrier Index", f"{barrier_index:.2f}")
-    c2.metric("Probability of frequent use", f"{probability:.1%}")
-
-    st.plotly_chart(
-        radar_chart(
-            user_input.values[0].tolist(),
-            "Your simulated pedestrian profile"
-        ),
-        use_container_width=True
+    st.dataframe(
+        df["How often do you use crosswalk"]
+        .value_counts()
+        .reindex(FREQUENCY_ORDER, fill_value=0)
+        .rename_axis("Frequency")
+        .to_frame("Respondents"),
+        use_container_width=True,
     )
+
+    st.subheader("Research limitations")
+
+    st.markdown("""
+    - Survey responses are not direct observations of crossings,
+      traffic conflicts, injuries, or crashes.
+    - The frequent-use outcome is derived from a self-reported category.
+    - Associations cannot establish that a barrier causes behavior.
+    - Representativeness depends on the original sampling procedure.
+    - Confirm the original questionnaire and response scale.
+    - A research paper should report uncertainty, sensitivity analyses,
+      sampling limitations, and relevant prior literature.
+    """)
+
+    st.download_button(
+        label="Download analyzed data as CSV",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name="crosswalkgap_analyzed_data.csv",
+        mime="text/csv",
+    )
+
+
+# FOOTER
+st.sidebar.divider()
+
+st.sidebar.caption(
+    "CrossWalkGap research prototype | "
+    "Associations are not causal effects."
+)
